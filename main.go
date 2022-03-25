@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ecs"
+	"github.com/aws/aws-sdk-go/service/elbv2"
 )
 
 var (
@@ -25,6 +26,7 @@ var (
 
 type serviceHandler struct {
 	session        *ecs.ECS
+	elbv2Session   *elbv2.ELBV2
 	serviceName    *string
 	clusterName    *string
 	checkInterval  int
@@ -38,6 +40,7 @@ type serviceHandler struct {
 func newServiceHandler(awsSession *session.Session, serviceName, clusterName string, checkInternval, checktimeout int) *serviceHandler {
 	return &serviceHandler{
 		session:       ecs.New(awsSession),
+		elbv2Session:  elbv2.New(awsSession),
 		serviceName:   aws.String(serviceName),
 		clusterName:   aws.String(clusterName),
 		checkInterval: checkInternval,
@@ -195,6 +198,12 @@ func (sh *serviceHandler) printLastNEvents(n int) error {
 	if err := sh.refresh(); err != nil {
 		return err
 	}
+
+	if len(sh.currentOutput.Events) == 0 {
+		fmt.Println("No events found")
+		return nil
+	}
+
 	if len(sh.currentOutput.Events) < n {
 		n = len(sh.currentOutput.Events) - 1
 		if n == 0 {
@@ -238,6 +247,38 @@ func (sh *serviceHandler) printLastNTasks(n int) error {
 	fmt.Println(out)
 
 	return nil
+}
+
+func (sh *serviceHandler) checkTargetGroup() (bool, error) {
+	if err := sh.refresh(); err != nil {
+		return false, err
+	}
+
+	if len(sh.currentOutput.LoadBalancers) == 0 {
+		fmt.Println("No load balancer to check.")
+		return true, nil
+	}
+
+	healthOutput, err := sh.elbv2Session.DescribeTargetHealth(
+		&elbv2.DescribeTargetHealthInput{
+			TargetGroupArn: sh.currentOutput.LoadBalancers[0].TargetGroupArn,
+		},
+	)
+	if err != nil {
+		return false, err
+	}
+	allHealthy := true
+	for _, target := range healthOutput.TargetHealthDescriptions {
+		if aws.StringValue(target.TargetHealth.State) != "healthy" {
+			allHealthy = false
+		}
+	}
+
+	if !allHealthy {
+		return false, nil
+	}
+
+	return true, nil
 }
 
 func main() {
@@ -290,13 +331,30 @@ func main() {
 		exitOut(ecsService, 1)
 	}
 	fmt.Println("Deployments checked.")
-	// Is the desired count the same as the running count.
-	fmt.Println("Checking that running matches desired tasks.")
-	err = ecsService.checkPendingCount()
-	if err != nil {
-		fmt.Printf("There was an error checking the pending out. Error: %s\n", err)
-		exitOut(ecsService, 1)
+
+	serviceOk := false
+	for !serviceOk {
+		// Is the desired count the same as the running count.
+		fmt.Println("Checking that running matches desired tasks.")
+		err = ecsService.checkPendingCount()
+		if err != nil {
+			fmt.Printf("There was an error checking the pending count. Error: %s\n", err)
+			exitOut(ecsService, 1)
+		}
+		fmt.Println("Checking the target group is in a good state.")
+		ok, err := ecsService.checkTargetGroup()
+		if err != nil {
+			fmt.Printf("There was an error checking the service target group. Error: %s\n", err)
+			exitOut(ecsService, 1)
+		}
+		if ok {
+			serviceOk = true
+		} else {
+			fmt.Printf("Waiting %d seconds before checking tasks again.\n", *flagCheckInterval)
+			time.Sleep(time.Second * time.Duration(*flagCheckInterval))
+		}
 	}
+
 	fmt.Println("Service looks good.")
 }
 
@@ -312,8 +370,6 @@ func verbosePrint(format string, args ...interface{}) {
 
 func exitOut(ecsService *serviceHandler, code int) {
 	fmt.Printf("Here is some trouble shooting information for %s.\n", *ecsService.serviceName)
-	ecsService.printLastNEvents(10)
-
 	fmt.Println("Historical events, showing maximum 10:")
 	if err := ecsService.printLastNEvents(10); err != nil {
 		fmt.Printf("There was an error listing the events. Error: %s", err)
