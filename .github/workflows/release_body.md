@@ -1,9 +1,10 @@
-# 0.0.2
+# 0.0.3
 
 ## Major changes
 
-AWTY will check to see that the ECS containers are healthy in the LoadBalancers if there is a load balancer.
+Just bug fixes.
 
 ## Bug fixes
 
-* Fixed a bug when looking up old events.
+* Check to see if there are tasks given back if there was a failure.
+* Get the deployment id based on the PRIMARY deployment not what ever is in progress.

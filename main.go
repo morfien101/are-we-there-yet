@@ -61,6 +61,16 @@ func (sh *serviceHandler) deploymentState(deployment *ecs.Deployment, desiredSta
 	return aws.StringValue(deployment.RolloutState) == desiredState
 }
 
+func (sh *serviceHandler) getActiveDeploymentId() string {
+	fmt.Println(sh.currentOutput.Deployments)
+	for _, deployment := range sh.currentOutput.Deployments {
+		if aws.StringValue(deployment.Status) == "PRIMARY" {
+			return aws.StringValue(deployment.Id)
+		}
+	}
+	return ""
+}
+
 func (sh *serviceHandler) describeServiceRaw() (*ecs.DescribeServicesOutput, error) {
 	return sh.session.DescribeServices(sh.describeServiceInput)
 }
@@ -89,28 +99,17 @@ func (sh *serviceHandler) checkDeployments() error {
 		return err
 	}
 
-	for _, deployment := range sh.currentOutput.Deployments {
-		if sh.deploymentState(deployment, "COMPLETED") {
-			continue
-		}
-		if sh.deploymentState(deployment, "IN_PROGRESS") {
-			fmt.Println("Found in progress deployment", *deployment.Id)
-			err := sh.waitForDeployment(aws.StringValue(deployment.Id))
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	deploymentToCheck := sh.getActiveDeploymentId()
+	fmt.Printf("Current Primary deployment is: %s.\n", deploymentToCheck)
+	return sh.waitForDeployment(deploymentToCheck)
 }
 
 func (sh *serviceHandler) waitForDeployment(deploymentId string) error {
-	// Check the deployment is already finished. No need to wait the first check interval
 	isComplete := func() (string, bool) {
 		for _, deployment := range sh.currentOutput.Deployments {
 			if aws.StringValue(deployment.Id) == deploymentId {
 				if sh.deploymentState(deployment, "COMPLETED") {
-					fmt.Println("Deployment is complete")
+					fmt.Printf("Deployment %s is in state %s.\n", aws.StringValue(deployment.Id), aws.StringValue(deployment.RolloutState))
 					return aws.StringValue(deployment.RolloutState), true
 				} else {
 					return aws.StringValue(deployment.RolloutState), false
@@ -118,6 +117,11 @@ func (sh *serviceHandler) waitForDeployment(deploymentId string) error {
 			}
 		}
 		return "NOT_FOUND", false
+	}
+
+	// Check the deployment is already finished. No need to wait the first check interval
+	if _, ok := isComplete(); ok {
+		return nil
 	}
 
 	checkTimer := time.NewTicker(time.Second * 10)
@@ -128,7 +132,7 @@ func (sh *serviceHandler) waitForDeployment(deploymentId string) error {
 	for {
 		select {
 		case <-checkTimer.C:
-			fmt.Printf("Checking if %s is now COMPLETE\n", deploymentId)
+			fmt.Printf("Checking if %s is now COMPLETED.\n", deploymentId)
 			if err := sh.refresh(); err != nil {
 				return err
 			}
@@ -139,7 +143,7 @@ func (sh *serviceHandler) waitForDeployment(deploymentId string) error {
 			if status == "NOT_FOUND" {
 				return fmt.Errorf("deployment disappeared")
 			}
-			fmt.Printf("Waiting another %d seconds for deployment %s to change to COMPLETED, currently %s\n", sh.checkInterval, deploymentId, status)
+			fmt.Printf("Waiting another %d seconds for deployment %s to change to COMPLETED, currently %s.\n", sh.checkInterval, deploymentId, status)
 		case <-timeout.C:
 			return fmt.Errorf("timeouted out waiting for deployment to happen")
 		}
@@ -217,7 +221,7 @@ func (sh *serviceHandler) printLastNEvents(n int) error {
 }
 
 func (sh *serviceHandler) printLastNTasks(n int) error {
-	tasksLit, err := sh.session.ListTasks(&ecs.ListTasksInput{
+	tasksList, err := sh.session.ListTasks(&ecs.ListTasksInput{
 		Cluster:       sh.clusterName,
 		ServiceName:   sh.serviceName,
 		DesiredStatus: aws.String("STOPPED"),
@@ -227,17 +231,20 @@ func (sh *serviceHandler) printLastNTasks(n int) error {
 		return err
 	}
 
-	if len(tasksLit.TaskArns) < n {
-		n = len(tasksLit.TaskArns) - 1
+	if len(tasksList.TaskArns) == 0 {
+		fmt.Printf("AWS API returned no STOPPED tasks to show.")
+		return nil
+	}
+
+	if len(tasksList.TaskArns) < n {
+		n = len(tasksList.TaskArns) - 1
 		if n == 0 {
 			n = 1
 		}
 	}
-	println(len(tasksLit.TaskArns))
-	println(n)
 
 	out, err := sh.session.DescribeTasks(&ecs.DescribeTasksInput{
-		Tasks:   tasksLit.TaskArns[0:n],
+		Tasks:   tasksList.TaskArns[0:n],
 		Cluster: sh.clusterName,
 	})
 	if err != nil {
@@ -324,7 +331,7 @@ func main() {
 	}
 
 	// Is there a deployment on going?
-	fmt.Println("Checking if there is a pending deployment.")
+	fmt.Println("Looking at deployments status.")
 	err = ecsService.checkDeployments()
 	if err != nil {
 		fmt.Printf("there was an error while checking the state of deployments. Error: %s\n", err)
